@@ -7,7 +7,9 @@ const tgUser = tg?.initDataUnsafe?.user || { first_name: "User", id: 0 };
 if (tg) { tg.ready(); tg.expand(); tg.setHeaderColor("#0F0F0F"); tg.setBackgroundColor("#0F0F0F"); }
 
 // ── API client ───────────────────────────────────────────────────────────────
-const API = "https://your-domain.com/miniapp/api";
+const API =
+  import.meta.env.VITE_API_URL ||
+  "/miniapp/api";
 let _sessionToken = null;
 
 async function apiCall(method, path, body) {

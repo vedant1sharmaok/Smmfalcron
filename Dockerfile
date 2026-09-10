@@ -46,28 +46,28 @@ RUN pip install --upgrade pip && \
 
 
 # ------------------------------------------------------------
-# Application source
+# Backend
 # ------------------------------------------------------------
 COPY app ./app
 COPY migrations ./migrations
 
 
 # ------------------------------------------------------------
-# Frontend build
+# Frontend
 #
-# Vite is configured to output to:
-# app/static/miniapp
+# IMPORTANT:
+# frontend/vite.config.js currently outputs to:
+# ../app/static/miniapp
+#
+# We therefore need the builder to create it inside a
+# dedicated location that can be copied between stages.
 # ------------------------------------------------------------
-COPY --from=frontend-builder /frontend/../app/static/miniapp ./app/static/miniapp
+COPY --from=frontend-builder /frontend/dist ./app/static/miniapp
 
 
 # ------------------------------------------------------------
-# Render port
+# Render
 # ------------------------------------------------------------
 EXPOSE 8000
 
-
-# ------------------------------------------------------------
-# Start FastAPI
-# ------------------------------------------------------------
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

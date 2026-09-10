@@ -93,7 +93,6 @@ class ProviderRegistry:
         async with self._lock:
             stmt = select(Provider).where(
                 Provider.is_active == True,
-                Provider.is_deleted == False,
             ).order_by(Provider.priority.desc())
 
             result = await db.execute(stmt)

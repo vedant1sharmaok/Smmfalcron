@@ -5,7 +5,7 @@ export default defineConfig({
   plugins: [react()],
   build: {
     // FastAPI serves /static/miniapp — built assets land here directly.
-    outDir:    "../app/static/miniapp",
+    outDir:    "dist",
     emptyOutDir: true,
     // Chunk strategy: vendor split for better caching.
     rollupOptions: {
@@ -31,5 +31,5 @@ export default defineConfig({
     },
   },
   // Base path served at root in Telegram's iframe.
-  base: "/static/miniapp/",
+  base: "/",
 });

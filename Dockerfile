@@ -1,5 +1,5 @@
 # ============================================================
-# Stage 1: Build React/Vite frontend
+# Stage 1 — Build React/Vite Mini App
 # ============================================================
 FROM node:20-alpine AS frontend-builder
 
@@ -15,7 +15,7 @@ RUN npm run build
 
 
 # ============================================================
-# Stage 2: Python backend + built frontend
+# Stage 2 — Python/FastAPI application
 # ============================================================
 FROM python:3.12-slim
 
@@ -26,27 +26,48 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# System packages
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    curl \
+# ------------------------------------------------------------
+# System dependencies
+# ------------------------------------------------------------
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
-COPY requirements.txt ./
+
+# ------------------------------------------------------------
+# Python dependencies
+# ------------------------------------------------------------
+COPY requirements.txt ./requirements.txt
 
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt
 
-# Copy backend/application source
+
+# ------------------------------------------------------------
+# Application source
+# ------------------------------------------------------------
 COPY app ./app
 COPY migrations ./migrations
 
-# Copy frontend build
-COPY --from=frontend-builder /frontend/dist ./frontend/dist
 
-# Expose Render port
+# ------------------------------------------------------------
+# Frontend build
+#
+# Vite is configured to output to:
+# app/static/miniapp
+# ------------------------------------------------------------
+COPY --from=frontend-builder /frontend/../app/static/miniapp ./app/static/miniapp
+
+
+# ------------------------------------------------------------
+# Render port
+# ------------------------------------------------------------
 EXPOSE 8000
 
+
+# ------------------------------------------------------------
 # Start FastAPI
+# ------------------------------------------------------------
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

@@ -73,17 +73,37 @@ def _get_url() -> str:
       postgresql://
       postgresql+asyncpg://
       postgres://
+
+    In production, DATABASE_URL must be supplied by the environment.
     """
 
-    url = (
-        os.environ.get("DATABASE_URL")
-        or config.get_main_option("sqlalchemy.url", "")
-    ).strip()
+    # -----------------------------------------------------------------------
+    # Prefer the actual environment variable.
+    #
+    # Render injects DATABASE_URL into the container environment.
+    # -----------------------------------------------------------------------
+
+    env_url = os.environ.get("DATABASE_URL", "").strip()
+
+    if env_url:
+        url = env_url
+    else:
+        # -------------------------------------------------------------------
+        # Preserve the existing local-development fallback.
+        #
+        # This keeps old functionality intact while allowing local Alembic
+        # usage through alembic.ini.
+        # -------------------------------------------------------------------
+
+        url = config.get_main_option(
+            "sqlalchemy.url",
+            "",
+        ).strip()
 
     if not url:
         raise RuntimeError(
-            "DATABASE_URL is not configured and "
-            "sqlalchemy.url is empty in alembic.ini"
+            "DATABASE_URL is missing. "
+            "Set DATABASE_URL in the Render Environment Variables."
         )
 
     # -----------------------------------------------------------------------
@@ -109,8 +129,13 @@ def _get_url() -> str:
     # Remove it because SSL is supplied through connect_args below.
     # -----------------------------------------------------------------------
 
-    if "sslmode=" in url:
-        from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+    if "sslmode=" in url.lower():
+        from urllib.parse import (
+            urlsplit,
+            urlunsplit,
+            parse_qsl,
+            urlencode,
+        )
 
         parsed = urlsplit(url)
 
@@ -180,7 +205,10 @@ async def run_async_migrations() -> None:
     # Supabase requires SSL.
     needs_ssl = (
         "supabase" in url.lower()
-        or os.environ.get("DATABASE_SSL", "").lower() == "require"
+        or os.environ.get(
+            "DATABASE_SSL",
+            "",
+        ).lower() == "require"
     )
 
     cfg = config.get_section(

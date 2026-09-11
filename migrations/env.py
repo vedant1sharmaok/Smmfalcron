@@ -6,55 +6,143 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy.ext.asyncio import async_engine_from_config
 from sqlalchemy import pool
+from sqlalchemy.ext.asyncio import async_engine_from_config
 
-config          = context.config
-target_metadata = None
+
+# ---------------------------------------------------------------------------
+# Make the project root importable.
+#
+# Render/Docker layout:
+#   /app/
+#       alembic.ini
+#       app/
+#       migrations/
+#
+# migrations/env.py is therefore one directory below the project root.
+# ---------------------------------------------------------------------------
+
+PROJECT_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..")
+)
+
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+
+# ---------------------------------------------------------------------------
+# Alembic configuration
+# ---------------------------------------------------------------------------
+
+config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Import all models so Alembic autogenerate sees them
-try:
-    from app.core.models import Base
-    target_metadata = Base.metadata
-except Exception as exc:
-    import warnings
-    warnings.warn(f"Could not import app models: {exc}")
 
+# ---------------------------------------------------------------------------
+# Import application models
+# ---------------------------------------------------------------------------
+#
+# Do NOT silently catch import errors here.
+# If a model/dependency is broken, Alembic must show the real error.
+# ---------------------------------------------------------------------------
+
+from app.core.models import Base
+
+target_metadata = Base.metadata
+
+
+# ---------------------------------------------------------------------------
+# Database URL
+# ---------------------------------------------------------------------------
 
 def _get_url() -> str:
     """
-    Resolve the database URL from the environment.
+    Resolve the database URL.
 
     Priority:
-      1. DATABASE_URL environment variable (Render / production)
-      2. alembic.ini sqlalchemy.url (local fallback)
+      1. DATABASE_URL environment variable
+      2. alembic.ini sqlalchemy.url
 
-    Supabase session pooler requires SSL. Strip ?sslmode=require
-    from the URL — it will be passed as a connect_arg instead.
+    Supports:
+      postgresql://
+      postgresql+asyncpg://
+      postgres://
     """
-    url = os.environ.get("DATABASE_URL") or config.get_main_option("sqlalchemy.url", "")
 
-    # asyncpg doesn't accept ?sslmode=require — strip it.
-    if "sslmode=require" in url:
-        url = url.split("?")[0]
+    url = (
+        os.environ.get("DATABASE_URL")
+        or config.get_main_option("sqlalchemy.url", "")
+    ).strip()
 
-    # Alembic/SQLAlchemy needs postgresql+asyncpg:// for async engine
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL is not configured and "
+            "sqlalchemy.url is empty in alembic.ini"
+        )
+
+    # -----------------------------------------------------------------------
+    # Convert PostgreSQL URL to asyncpg URL.
+    # -----------------------------------------------------------------------
+
     if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
-    elif url.startswith("postgresql://") and "+asyncpg" not in url:
-        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        url = url.replace(
+            "postgres://",
+            "postgresql+asyncpg://",
+            1,
+        )
+
+    elif url.startswith("postgresql://"):
+        url = url.replace(
+            "postgresql://",
+            "postgresql+asyncpg://",
+            1,
+        )
+
+    # -----------------------------------------------------------------------
+    # asyncpg does not use SQLAlchemy's sslmode=require query parameter.
+    # Remove it because SSL is supplied through connect_args below.
+    # -----------------------------------------------------------------------
+
+    if "sslmode=" in url:
+        from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
+        parsed = urlsplit(url)
+
+        query = [
+            (key, value)
+            for key, value in parse_qsl(
+                parsed.query,
+                keep_blank_values=True,
+            )
+            if key.lower() != "sslmode"
+        ]
+
+        url = urlunsplit(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                urlencode(query),
+                parsed.fragment,
+            )
+        )
 
     return url
 
 
+# ---------------------------------------------------------------------------
+# Offline migrations
+# ---------------------------------------------------------------------------
+
 def run_migrations_offline() -> None:
     url = _get_url()
+
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -62,9 +150,14 @@ def run_migrations_offline() -> None:
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
     )
+
     with context.begin_transaction():
         context.run_migrations()
 
+
+# ---------------------------------------------------------------------------
+# Online migration callback
+# ---------------------------------------------------------------------------
 
 def do_run_migrations(connection) -> None:
     context.configure(
@@ -72,18 +165,33 @@ def do_run_migrations(connection) -> None:
         target_metadata=target_metadata,
         compare_type=True,
     )
+
     with context.begin_transaction():
         context.run_migrations()
 
 
+# ---------------------------------------------------------------------------
+# Async migrations
+# ---------------------------------------------------------------------------
+
 async def run_async_migrations() -> None:
     url = _get_url()
-    needs_ssl = "supabase" in url or os.environ.get("DATABASE_SSL", "") == "require"
 
-    cfg = config.get_section(config.config_ini_section, {})
+    # Supabase requires SSL.
+    needs_ssl = (
+        "supabase" in url.lower()
+        or os.environ.get("DATABASE_SSL", "").lower() == "require"
+    )
+
+    cfg = config.get_section(
+        config.config_ini_section,
+        {},
+    )
+
     cfg["sqlalchemy.url"] = url
 
     connect_args = {}
+
     if needs_ssl:
         connect_args["ssl"] = "require"
 
@@ -93,14 +201,25 @@ async def run_async_migrations() -> None:
         poolclass=pool.NullPool,
         connect_args=connect_args,
     )
-    async with connectable.connect() as conn:
-        await conn.run_sync(do_run_migrations)
-    await connectable.dispose()
 
+    try:
+        async with connectable.connect() as conn:
+            await conn.run_sync(do_run_migrations)
+    finally:
+        await connectable.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Online migration entry point
+# ---------------------------------------------------------------------------
 
 def run_migrations_online() -> None:
     asyncio.run(run_async_migrations())
 
+
+# ---------------------------------------------------------------------------
+# Alembic entry point
+# ---------------------------------------------------------------------------
 
 if context.is_offline_mode():
     run_migrations_offline()

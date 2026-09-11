@@ -13,8 +13,8 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # ── Database ───────────────────────────────────────────────────────────
-    database_url: str      = "postgresql+asyncpg://smm_app:dev@localhost:5432/smm_platform"
-    database_url_sync: str = "postgresql://smm_app:dev@localhost:5432/smm_platform"
+    database_url: str      = ""
+    database_url_sync: str = ""
     db_pool_size: int      = 5
     db_max_overflow: int   = 10
 

@@ -1,7 +1,17 @@
 """
 Alembic migration environment — async SQLAlchemy with asyncpg.
-Compatible with Supabase session pooler (SSL).
+
+Compatible with:
+- Render
+- Supabase Session Pooler
+- PostgreSQL
+- postgresql://
+- postgresql+asyncpg://
+- postgres://
+
+DATABASE_URL MUST be provided through the environment.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -15,15 +25,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 
 # ---------------------------------------------------------------------------
-# Make the project root importable.
-#
-# Render/Docker layout:
-#   /app/
-#       alembic.ini
-#       app/
-#       migrations/
-#
-# migrations/env.py is therefore one directory below the project root.
+# Project path
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = os.path.abspath(
@@ -40,6 +42,7 @@ if PROJECT_ROOT not in sys.path:
 
 config = context.config
 
+
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
@@ -47,12 +50,9 @@ if config.config_file_name is not None:
 # ---------------------------------------------------------------------------
 # Import application models
 # ---------------------------------------------------------------------------
-#
-# Do NOT silently catch import errors here.
-# If a model/dependency is broken, Alembic must show the real error.
-# ---------------------------------------------------------------------------
 
 from app.core.models import Base
+
 
 target_metadata = Base.metadata
 
@@ -65,40 +65,19 @@ def _get_url() -> str:
     """
     Resolve the database URL.
 
-    Priority:
-      1. DATABASE_URL environment variable
-      2. alembic.ini sqlalchemy.url
+    DATABASE_URL MUST come from the environment.
 
-    Supports:
-      postgresql://
-      postgresql+asyncpg://
-      postgres://
+    This intentionally does NOT fall back to alembic.ini.
+    That prevents Alembic from accidentally connecting to
+    localhost:5432 on Render.
 
-    In production, DATABASE_URL must be supplied by the environment.
+    Supported formats:
+        postgresql://
+        postgresql+asyncpg://
+        postgres://
     """
 
-    # -----------------------------------------------------------------------
-    # Prefer the actual environment variable.
-    #
-    # Render injects DATABASE_URL into the container environment.
-    # -----------------------------------------------------------------------
-
-    env_url = os.environ.get("DATABASE_URL", "").strip()
-
-    if env_url:
-        url = env_url
-    else:
-        # -------------------------------------------------------------------
-        # Preserve the existing local-development fallback.
-        #
-        # This keeps old functionality intact while allowing local Alembic
-        # usage through alembic.ini.
-        # -------------------------------------------------------------------
-
-        url = config.get_main_option(
-            "sqlalchemy.url",
-            "",
-        ).strip()
+    url = os.environ.get("DATABASE_URL", "").strip()
 
     if not url:
         raise RuntimeError(
@@ -106,10 +85,7 @@ def _get_url() -> str:
             "Set DATABASE_URL in the Render Environment Variables."
         )
 
-    # -----------------------------------------------------------------------
-    # Convert PostgreSQL URL to asyncpg URL.
-    # -----------------------------------------------------------------------
-
+    # Render/Supabase may provide postgres://
     if url.startswith("postgres://"):
         url = url.replace(
             "postgres://",
@@ -117,6 +93,7 @@ def _get_url() -> str:
             1,
         )
 
+    # Convert normal PostgreSQL URL to asyncpg URL
     elif url.startswith("postgresql://"):
         url = url.replace(
             "postgresql://",
@@ -125,11 +102,12 @@ def _get_url() -> str:
         )
 
     # -----------------------------------------------------------------------
-    # asyncpg does not use SQLAlchemy's sslmode=require query parameter.
-    # Remove it because SSL is supplied through connect_args below.
+    # asyncpg does not use sslmode=require as a normal libpq URL parameter.
+    # Remove sslmode from the URL and configure SSL through connect_args.
     # -----------------------------------------------------------------------
 
     if "sslmode=" in url.lower():
+
         from urllib.parse import (
             urlsplit,
             urlunsplit,
@@ -166,13 +144,21 @@ def _get_url() -> str:
 # ---------------------------------------------------------------------------
 
 def run_migrations_offline() -> None:
+    """
+    Run migrations in offline mode.
+
+    This generates SQL without requiring a live database connection.
+    """
+
     url = _get_url()
 
     context.configure(
         url=url,
         target_metadata=target_metadata,
         literal_binds=True,
-        dialect_opts={"paramstyle": "named"},
+        dialect_opts={
+            "paramstyle": "named",
+        },
         compare_type=True,
     )
 
@@ -181,10 +167,14 @@ def run_migrations_offline() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Online migration callback
+# Online migration configuration
 # ---------------------------------------------------------------------------
 
 def do_run_migrations(connection) -> None:
+    """
+    Configure Alembic against an active database connection.
+    """
+
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
@@ -200,9 +190,15 @@ def do_run_migrations(connection) -> None:
 # ---------------------------------------------------------------------------
 
 async def run_async_migrations() -> None:
+    """
+    Create an async SQLAlchemy engine and execute Alembic migrations.
+    """
+
     url = _get_url()
 
     # Supabase requires SSL.
+    #
+    # DATABASE_SSL=require can also be used explicitly on Render.
     needs_ssl = (
         "supabase" in url.lower()
         or os.environ.get(
@@ -216,6 +212,10 @@ async def run_async_migrations() -> None:
         {},
     )
 
+    if cfg is None:
+        cfg = {}
+
+    # Override alembic.ini with the real environment URL.
     cfg["sqlalchemy.url"] = url
 
     connect_args = {}
@@ -232,7 +232,10 @@ async def run_async_migrations() -> None:
 
     try:
         async with connectable.connect() as conn:
-            await conn.run_sync(do_run_migrations)
+            await conn.run_sync(
+                do_run_migrations
+            )
+
     finally:
         await connectable.dispose()
 
@@ -242,7 +245,13 @@ async def run_async_migrations() -> None:
 # ---------------------------------------------------------------------------
 
 def run_migrations_online() -> None:
-    asyncio.run(run_async_migrations())
+    """
+    Run Alembic migrations using an async PostgreSQL connection.
+    """
+
+    asyncio.run(
+        run_async_migrations()
+    )
 
 
 # ---------------------------------------------------------------------------

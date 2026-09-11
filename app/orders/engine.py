@@ -238,11 +238,15 @@ async def create_order(
     # ── Step 12-13: Submit to provider ────────────────────────────────────────
     try:
         from app.providers.registry import registry
-        provider_result = await registry.create_order(
-            provider_id=provider.id,
+        from app.providers.models import OrderRequest as ProviderOrderRequest
+        _order_req = ProviderOrderRequest(
             provider_svc_id=mapping.provider_svc_id,
             quantity=quantity,
             link=link or "",
+        )
+        provider_result = await registry.create_order(
+            provider_id=provider.id,
+            req=_order_req,
         )
         order.provider_order_id = provider_result.provider_order_id
         order.status            = "processing"

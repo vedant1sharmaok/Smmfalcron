@@ -26,6 +26,11 @@ class RedisKeys:
     def fmt(template: str, **kwargs) -> str:
         return template.format(**kwargs)
 
+    @staticmethod
+    def circuit_breaker(provider_id: int) -> str:
+        """Redis key for provider circuit-breaker state."""
+        return f"cb:provider:{provider_id}"
+
 
 async def init_redis() -> None:
     global _redis_pool

@@ -24,7 +24,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# System deps: pg_dump for backup worker, curl for health checks
+# System deps
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential \
@@ -40,16 +40,13 @@ RUN pip install --upgrade pip && \
 # Application source
 COPY app ./app
 COPY migrations ./migrations
+COPY alembic.ini ./
 
-# Copy compiled React Mini App into the static directory
+# Copy compiled React Mini App
 COPY --from=frontend-builder /frontend/dist ./app/static/miniapp
 
 EXPOSE 8000
 
-# Start: run Alembic migrations then start the server.
-# --workers 1 is intentional for Render free tier (limited RAM).
-# Remove --workers 1 and set APP_WORKERS env var for paid plans.
-CMD ["sh", "-c", "\
-    alembic upgrade head && \
-    uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --loop uvloop \
-"]
+# Run migrations then start the server.
+# DATABASE_URL must be set as a Render environment variable.
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --loop uvloop"]

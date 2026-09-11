@@ -28,7 +28,6 @@ class RedisKeys:
 
     @staticmethod
     def circuit_breaker(provider_id: int) -> str:
-        """Redis key for provider circuit-breaker state."""
         return f"cb:provider:{provider_id}"
 
 

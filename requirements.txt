@@ -30,8 +30,8 @@ prometheus-client>=0.20,<1.0
 
 # ── Cryptography ───────────────────────────────────────────────────────────────
 cryptography>=43,<47
-passlib[bcrypt]>=1.7,<2.0       # admin password hashing (bcrypt rounds=12)
-python-jose[cryptography]>=3.3,<4.0  # admin JWT signing/verification
+passlib[bcrypt]>=1.7,<2.0
+python-jose[cryptography]>=3.3,<4.0
 
 # ── Background workers ─────────────────────────────────────────────────────────
 arq>=0.26,<1.0

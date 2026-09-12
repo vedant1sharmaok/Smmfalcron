@@ -23,8 +23,8 @@ class Settings(BaseSettings):
     # ── Database ──────────────────────────────────────────────────────────────
     # Defaults are localhost — only for local dev.
     # On Render: set DATABASE_URL in the Render environment variables panel.
-    database_url: str      = "postgresql+asyncpg://postgres.nvbwbyhuaeedcixnjeuo:Aa7737057478@aws-0-ap-northeast-1.pooler.supabase.com:5432/postgres"
-    database_url_sync: str = "postgresql://postgres.nvbwbyhuaeedcixnjeuo:Aa7737057478@aws-0-ap-northeast-1.pooler.supabase.com:5432/postgres"
+    database_url: str
+    database_url_sync: str
     db_pool_size: int      = 5
     db_max_overflow: int   = 10
 

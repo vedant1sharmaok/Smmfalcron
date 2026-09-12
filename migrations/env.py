@@ -20,6 +20,10 @@ import sys
 from logging.config import fileConfig
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # ── CRITICAL: add the container root to sys.path ──────────────────────────────
 # In the Docker image the app is at /app/app/... and the working dir is /app.
 # Without this, `from app.core.models import Base` fails with:

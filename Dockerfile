@@ -11,7 +11,6 @@ RUN npm install
 COPY frontend/ .
 RUN npm run build
 
-
 # ============================================================
 # Stage 2 — Backend (Python 3.12)
 # ============================================================
@@ -42,11 +41,12 @@ COPY app ./app
 COPY migrations ./migrations
 COPY alembic.ini ./
 
-# Copy compiled React Mini App
+# Copy compiled React Mini App into FastAPI's static directory
 COPY --from=frontend-builder /frontend/dist ./app/static/miniapp
 
 EXPOSE 8000
 
-# Run migrations then start the server.
+# Run Alembic migrations then start the API server.
 # DATABASE_URL must be set as a Render environment variable.
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --loop uvloop"]
+# PYTHONPATH=. ensures `from app.xxx import` works in migrations/env.py.
+CMD ["sh", "-c", "PYTHONPATH=. alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --loop uvloop"]

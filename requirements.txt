@@ -23,9 +23,9 @@ pydantic-settings>=2.4,<3.0
 # ── HTTP client ────────────────────────────────────────────────────────────────
 httpx>=0.27,<1.0
 
-# ── Retry / structured logging / metrics ──────────────────────────────────────
-tenacity>=8.5,<10.0
+# ── Structured logging / retry / metrics ──────────────────────────────────────
 structlog>=24.4,<26.0
+tenacity>=8.5,<10.0
 prometheus-client>=0.20,<1.0
 
 # ── Cryptography ───────────────────────────────────────────────────────────────
@@ -38,3 +38,6 @@ arq>=0.26,<1.0
 
 # ── TOTP (admin 2FA) ──────────────────────────────────────────────────────────
 pyotp>=2.9,<3.0
+
+# ── S3 backup (optional — backup worker degrades gracefully if unavailable) ────
+aioboto3>=12.0,<14.0

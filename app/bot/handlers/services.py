@@ -1,364 +1,360 @@
-"""
-Services handler — full browse flow.
-Section 5 of blueprint: Category → Service List → Service Detail → Order Form.
-Dynamic order forms generated from service capabilities (Section 5.3).
-Callbacks EDIT existing messages (Section 50.19).
-"""
+"""Category → service → details → dynamic order form → confirmation → debit."""
+
 from __future__ import annotations
-from decimal import Decimal
+
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.bot.keyboards import CB, back_home_keyboard, categories_keyboard, services_keyboard, service_detail_keyboard, qty_suggestions_keyboard, order_confirm_keyboard
-from app.bot.messages import categories_header, services_list_header, service_card, order_form_link_prompt, order_form_qty_prompt, order_preview_card, order_submitted, error_card, maintenance_card
-from app.bot.safe_send import safe_edit, safe_send
-from app.core.logging import get_logger
+from app.ads import apply_ad
+from app.bot.handlers.start import ensure_user, main_menu_text, menu_kb_for
+from app.bot.menus import (
+    CatCB,
+    MenuCB,
+    SvcCB,
+    html_escape,
+    categories_kb,
+    order_confirm_kb,
+    safe_edit,
+    service_detail_kb,
+    services_kb,
+)
+from app.catalog import get_service, list_categories, list_services
+from app.config import Settings
+from app.models import Service
+from app.orders import OrderError, place_order, status_label
+from app.pricing import paise_to_rupees_str, quote_order
+from app.wallet import InsufficientFunds, snapshot_of
 
-logger = get_logger(__name__)
 router = Router(name="services")
 
-PAGE_SIZE = 8   # services per page
+
+class OrderForm(StatesGroup):
+    link = State()
+    qty = State()
+    comments = State()
+    mentions = State()
+    coupon = State()
+    confirm = State()
 
 
-class OrderFSM(StatesGroup):
-    entering_link  = State()
-    entering_qty   = State()
-    entering_custom_qty = State()
-    confirming     = State()
+def _form_needs(service: Service) -> tuple[bool, bool]:
+    stype = (service.service_type or "default").lower()
+    return stype in {"comments", "custom_comments"}, stype in {"mentions", "comment_mentions"}
 
 
-def _qty_suggestions(min_qty: int, max_qty: int) -> list[int]:
-    """Generate up to 4 quantity presets between min and max."""
-    if min_qty == max_qty:
-        return [min_qty]
-    presets = [min_qty]
-    for mult in [5, 10, 50]:
-        v = min_qty * mult
-        if min_qty < v <= max_qty and v not in presets:
-            presets.append(v)
-        if len(presets) >= 4:
-            break
-    if max_qty not in presets:
-        presets.append(max_qty)
-    return sorted(set(presets))[:4]
+async def _show_categories(target: CallbackQuery | Message, session: AsyncSession) -> None:
+    cats = await list_categories(session)
+    if not cats:
+        await safe_edit(target, "No categories are available yet.", None)
+        return
+    text, markup = await apply_ad(
+        session, "services", "<b>Services</b>\nChoose a platform.", categories_kb(cats)
+    )
+    await safe_edit(target, text, markup)
 
 
-async def _check_policy_accepted(db, telegram_id: int) -> bool:
-    from sqlalchemy import select
-    from app.core.models import User
-    result = await db.execute(select(User).where(User.telegram_id == telegram_id))
-    user   = result.scalar_one_or_none()
-    return bool(user and (user.policy_version or 0) >= 1)
-
-
-# ── Category list ─────────────────────────────────────────────────────────────
-
-@router.callback_query(F.data == CB.CAT_LIST)
-async def show_categories(call: CallbackQuery, state: FSMContext) -> None:
-    await call.answer()
+@router.callback_query(MenuCB.filter(F.a == "services"))
+async def cb_services(
+    query: CallbackQuery, session: AsyncSession, state: FSMContext
+) -> None:
     await state.clear()
+    await _show_categories(query, session)
 
-    from app.core.database import AsyncSessionLocal
-    from sqlalchemy import select
-    from app.core.models import Category
 
-    async with AsyncSessionLocal() as db:
-        rows = list((await db.execute(
-            select(Category)
-            .where(Category.is_active == True)
-            .order_by(Category.sort_order, Category.id)
-        )).scalars().all())
-
-    if not rows:
-        await safe_edit(call.message,
-            "🛍️ <b>Services</b>\n\nNo service categories are currently available. Please check back soon.",
-            reply_markup=back_home_keyboard())
+@router.callback_query(CatCB.filter())
+async def cb_category(
+    query: CallbackQuery, callback_data: CatCB, session: AsyncSession, state: FSMContext
+) -> None:
+    await state.clear()
+    services = await list_services(session, callback_data.i)
+    if not services:
+        await safe_edit(query, "No services in this category.", categories_kb(await list_categories(session)))
         return
+    cat_name = services[0].category.name if services[0].category else "Services"
+    text, markup = await apply_ad(
+        session,
+        "services",
+        f"<b>{html_escape(cat_name)}</b>\nSelect a service.",
+        services_kb(callback_data.i, services),
+    )
+    await safe_edit(query, text, markup)
 
-    cats = [{"id": c.id, "name": c.name} for c in rows]
-    await safe_edit(call.message, categories_header(), reply_markup=categories_keyboard(cats))
 
-
-# ── Service list ──────────────────────────────────────────────────────────────
-
-@router.callback_query(F.data.startswith("svc:list:"))
-async def show_service_list(call: CallbackQuery, state: FSMContext) -> None:
-    await call.answer()
-    parts  = call.data.split(":")
-    cat_id = int(parts[2]) if len(parts) > 2 else 0
-    page   = int(parts[3]) if len(parts) > 3 else 1
-
-    from app.core.database import AsyncSessionLocal
-    from sqlalchemy import select, func
-    from app.core.models import Service, Category
-
-    async with AsyncSessionLocal() as db:
-        cat    = await db.get(Category, cat_id)
-        total  = (await db.execute(
-            select(func.count()).where(Service.is_active == True, Service.category_id == cat_id, Service.ordering_enabled == True)
-        )).scalar_one()
-        rows   = list((await db.execute(
-            select(Service)
-            .where(Service.is_active == True, Service.category_id == cat_id, Service.ordering_enabled == True)
-            .order_by(Service.sort_order, Service.id)
-            .offset((page - 1) * PAGE_SIZE).limit(PAGE_SIZE)
-        )).scalars().all())
-
-    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
-    cat_name    = cat.name if cat else "Services"
-    svcs        = [{"public_id": s.public_id, "display_name": s.display_name} for s in rows]
-
-    await safe_edit(
-        call.message,
-        services_list_header(cat_name, page, total_pages),
-        reply_markup=services_keyboard(svcs, cat_id, page, total_pages),
+async def _service_text(session: AsyncSession, service: Service, user_id: int) -> str:
+    quote = await quote_order(session, service_id=service.id, quantity=service.min_qty, user_id=user_id)
+    refill = "Yes" if service.is_refillable else "No"
+    cancel = "Yes" if service.is_cancelable else "No"
+    desc = html_escape(service.description or "")
+    reseller_line = ""
+    if quote.reseller_discount_paise:
+        reseller_line = f"\nReseller saving: {paise_to_rupees_str(quote.reseller_discount_paise)} at min qty"
+    return (
+        f"<b>{html_escape(service.name)}</b>\n"
+        f"{desc}\n\n"
+        f"Type: {html_escape(service.service_type)}\n"
+        f"Quantity: {service.min_qty:,} – {service.max_qty:,}\n"
+        f"Rate: <b>{paise_to_rupees_str(quote.sell_per_1000_paise)}</b> / 1,000\n"
+        f"Avg. start: {html_escape(service.average_time or 'varies')}\n"
+        f"Refill: {refill} · Cancel: {cancel}\n"
+        f"Min order: {paise_to_rupees_str(quote.charge_paise)} at {service.min_qty:,} qty"
+        f"{reseller_line}"
     )
 
 
-# ── Service detail ────────────────────────────────────────────────────────────
+@router.callback_query(SvcCB.filter(F.a == "v"))
+async def cb_service_view(
+    query: CallbackQuery, callback_data: SvcCB, session: AsyncSession, state: FSMContext
+) -> None:
+    await state.clear()
+    service = await get_service(session, callback_data.i)
+    if service is None or not service.is_active:
+        await query.answer("Service unavailable", show_alert=True)
+        return
+    text = await _service_text(session, service, query.from_user.id if query.from_user else 0)
+    await safe_edit(query, text, service_detail_kb(service))
 
-@router.callback_query(F.data.startswith("svc:detail:"))
-async def show_service_detail(call: CallbackQuery, state: FSMContext) -> None:
-    await call.answer()
-    public_id = call.data.split(":", 2)[2]
 
-    from app.core.database import AsyncSessionLocal
-    from sqlalchemy import select
-    from app.core.models import Service, Category, ServiceProviderMapping, ProviderService
+@router.callback_query(SvcCB.filter(F.a == "o"))
+async def cb_service_order(
+    query: CallbackQuery, callback_data: SvcCB, session: AsyncSession, state: FSMContext
+) -> None:
+    service = await get_service(session, callback_data.i)
+    if service is None or not service.is_active:
+        await query.answer("Service unavailable", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(service_id=service.id)
+    await state.set_state(OrderForm.link)
+    await safe_edit(
+        query,
+        f"<b>{html_escape(service.name)}</b>\n\n"
+        "Send the target link (or @username for profile-based services).\n"
+        "Send /cancel to abort.",
+        None,
+    )
 
-    async with AsyncSessionLocal() as db:
-        svc = (await db.execute(
-            select(Service).where(Service.public_id == public_id.upper())
-        )).scalar_one_or_none()
 
-        if svc is None or not svc.is_active:
-            await safe_edit(call.message, error_card("Service not found."), reply_markup=back_home_keyboard())
+@router.message(OrderForm.link)
+async def form_link(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    if not message.text or message.text.startswith("/"):
+        if message.text and message.text.startswith("/cancel"):
+            await state.clear()
+            await message.answer("Order cancelled.")
             return
-
-        cat = await db.get(Category, svc.category_id)
-
-        # Get provider-level min/max
-        mapping = (await db.execute(
-            select(ServiceProviderMapping).where(
-                ServiceProviderMapping.service_id == svc.id,
-                ServiceProviderMapping.is_primary == True,
-            )
-        )).scalar_one_or_none()
-
-        min_qty = max_qty = 0
-        rate    = svc.custom_price or Decimal("0")
-        refill  = svc.refill_enabled
-        cancel  = svc.cancel_enabled
-
-        if mapping:
-            prov_svc = (await db.execute(
-                select(ProviderService).where(
-                    ProviderService.provider_id == mapping.provider_id,
-                    ProviderService.provider_svc_id == mapping.provider_svc_id,
-                )
-            )).scalar_one_or_none()
-            if prov_svc:
-                min_qty = prov_svc.min_qty
-                max_qty = prov_svc.max_qty
-                if not rate:
-                    rate = prov_svc.rate
-                refill  = prov_svc.refill
-                cancel  = prov_svc.cancel
-
-    text = service_card(
-        public_id=svc.public_id,
-        display_name=svc.display_name,
-        category=cat.name if cat else "",
-        min_qty=min_qty,
-        max_qty=max_qty,
-        price_per_1000=rate,
-        refill=refill,
-        cancel=cancel,
-        requires_premium=svc.requires_premium,
-    )
-
-    await safe_edit(
-        call.message, text,
-        reply_markup=service_detail_keyboard(public_id, refill=refill, cancel=cancel),
-    )
-
-    # Store service context for order FSM
-    await state.update_data(
-        public_id=public_id, min_qty=min_qty, max_qty=max_qty,
-        price_per_1000=str(rate), service_name=svc.display_name,
-    )
-
-
-# ── Order flow ────────────────────────────────────────────────────────────────
-
-@router.callback_query(F.data.startswith("svc:order:"))
-async def start_order(call: CallbackQuery, state: FSMContext) -> None:
-    await call.answer()
-    public_id = call.data.split(":", 2)[2]
-    data      = await state.get_data()
-
-    if data.get("public_id") != public_id:
-        # Re-load service data if FSM lost context
-        from app.core.database import AsyncSessionLocal
-        from sqlalchemy import select
-        from app.core.models import Service, ServiceProviderMapping, ProviderService
-        async with AsyncSessionLocal() as db:
-            svc = (await db.execute(select(Service).where(Service.public_id == public_id.upper()))).scalar_one_or_none()
-            if not svc:
-                await safe_edit(call.message, error_card("Service not found."), reply_markup=back_home_keyboard()); return
-            mapping = (await db.execute(select(ServiceProviderMapping).where(
-                ServiceProviderMapping.service_id == svc.id, ServiceProviderMapping.is_primary == True,
-            ))).scalar_one_or_none()
-            min_qty = max_qty = 0; rate = svc.custom_price or Decimal("0")
-            if mapping:
-                ps = (await db.execute(select(ProviderService).where(
-                    ProviderService.provider_id == mapping.provider_id,
-                    ProviderService.provider_svc_id == mapping.provider_svc_id,
-                ))).scalar_one_or_none()
-                if ps: min_qty = ps.min_qty; max_qty = ps.max_qty; rate = rate or ps.rate
-            await state.update_data(public_id=public_id, min_qty=min_qty, max_qty=max_qty,
-                                    price_per_1000=str(rate), service_name=svc.display_name)
-            data = await state.get_data()
-
-    min_qty  = data.get("min_qty", 0)
-    max_qty  = data.get("max_qty", 0)
-    rate     = Decimal(str(data.get("price_per_1000", "0")))
-    svc_name = data.get("service_name", "Service")
-
-    await safe_edit(
-        call.message,
-        order_form_link_prompt(svc_name, min_qty, max_qty, rate),
-        reply_markup=back_home_keyboard(),
-    )
-    await state.set_state(OrderFSM.entering_link)
-
-
-@router.message(OrderFSM.entering_link)
-async def receive_link(message: Message, state: FSMContext) -> None:
-    link = message.text.strip() if message.text else ""
-    if not link or len(link) < 3:
-        await message.answer(error_card("Please enter a valid URL or username."))
+        await message.answer("Please send a link, or /cancel.")
         return
-
-    await state.update_data(link=link)
-    data    = await state.get_data()
-    min_qty = data.get("min_qty", 1)
-    max_qty = data.get("max_qty", 100000)
-
-    suggestions = _qty_suggestions(min_qty, max_qty)
+    await state.update_data(link=message.text.strip())
+    data = await state.get_data()
+    service = await get_service(session, data["service_id"])
+    if service is None:
+        await state.clear()
+        await message.answer("Service no longer available.")
+        return
+    await state.set_state(OrderForm.qty)
     await message.answer(
-        order_form_qty_prompt(min_qty, max_qty),
-        reply_markup=qty_suggestions_keyboard(suggestions, data.get("public_id", "")),
-        parse_mode="HTML",
+        f"Quantity? Min {service.min_qty:,} · Max {service.max_qty:,}",
     )
-    await state.set_state(OrderFSM.entering_qty)
 
 
-@router.callback_query(F.data.startswith("ord:qty:"))
-async def qty_suggestion_selected(call: CallbackQuery, state: FSMContext) -> None:
-    await call.answer()
-    parts     = call.data.split(":")
-    qty       = int(parts[3]) if len(parts) > 3 else 0
-    data      = await state.get_data()
-    await state.update_data(quantity=qty)
-    await _show_order_preview(call, state, data, qty)
-
-
-@router.callback_query(F.data.startswith("ord:qty_custom:"))
-async def qty_custom(call: CallbackQuery, state: FSMContext) -> None:
-    await call.answer()
-    data    = await state.get_data()
-    min_qty = data.get("min_qty", 1)
-    max_qty = data.get("max_qty", 100000)
-    await safe_edit(call.message,
-        f"Enter a custom quantity:\nMin: <b>{min_qty:,}</b>  Max: <b>{max_qty:,}</b>",
-        reply_markup=back_home_keyboard())
-    await state.set_state(OrderFSM.entering_custom_qty)
-
-
-@router.message(OrderFSM.entering_custom_qty)
-async def receive_custom_qty(message: Message, state: FSMContext) -> None:
+@router.message(OrderForm.qty)
+async def form_qty(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    raw = (message.text or "").replace(",", "").strip()
+    if raw.startswith("/cancel"):
+        await state.clear()
+        await message.answer("Order cancelled.")
+        return
     try:
-        qty  = int(message.text.strip())
-        data = await state.get_data()
-        min_qty = data.get("min_qty", 1)
-        max_qty = data.get("max_qty", 100000)
-        if qty < min_qty or qty > max_qty:
-            await message.answer(error_card(f"Quantity must be between {min_qty:,} and {max_qty:,}."), parse_mode="HTML")
-            return
-        await state.update_data(quantity=qty)
-        await state.set_state(OrderFSM.confirming)
-
-        rate  = Decimal(str(data.get("price_per_1000", "0")))
-        price = (rate * qty / 1000).quantize(Decimal("0.01"))
-        import uuid as _uuid
-        idem  = str(_uuid.uuid4())[:20]
-        await state.update_data(idem_key=idem, price=str(price))
-
-        await message.answer(
-            order_preview_card(data.get("service_name",""), qty, data.get("link",""), price),
-            reply_markup=order_confirm_keyboard(idem),
-            parse_mode="HTML",
-        )
+        qty = int(raw)
     except ValueError:
-        await message.answer(error_card("Please enter a valid number."), parse_mode="HTML")
+        await message.answer("Send a whole number for quantity.")
+        return
+    data = await state.get_data()
+    service = await get_service(session, data["service_id"])
+    if service is None:
+        await state.clear()
+        await message.answer("Service no longer available.")
+        return
+    if qty < service.min_qty or qty > service.max_qty:
+        await message.answer(f"Quantity must be between {service.min_qty:,} and {service.max_qty:,}.")
+        return
+    await state.update_data(quantity=qty)
+    needs_comments, needs_mentions = _form_needs(service)
+    if needs_comments:
+        await state.set_state(OrderForm.comments)
+        await message.answer("Send the comments, one per line.")
+        return
+    if needs_mentions:
+        await state.set_state(OrderForm.mentions)
+        await message.answer("Send usernames to mention, separated by spaces or commas.")
+        return
+    await state.set_state(OrderForm.coupon)
+    await message.answer("Coupon code? Send the code, or type <b>skip</b>.", parse_mode="HTML")
 
 
-async def _show_order_preview(call: CallbackQuery, state: FSMContext, data: dict, qty: int) -> None:
-    import uuid as _uuid
-    rate  = Decimal(str(data.get("price_per_1000", "0")))
-    price = (rate * qty / 1000).quantize(Decimal("0.01"))
-    idem  = str(_uuid.uuid4())[:20]
-    await state.update_data(quantity=qty, idem_key=idem, price=str(price))
-    await state.set_state(OrderFSM.confirming)
-    await safe_edit(
-        call.message,
-        order_preview_card(data.get("service_name",""), qty, data.get("link",""), price),
-        reply_markup=order_confirm_keyboard(idem),
+@router.message(OrderForm.comments)
+async def form_comments(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    if not message.text or message.text.startswith("/cancel"):
+        await state.clear()
+        await message.answer("Order cancelled.")
+        return
+    await state.update_data(comments=message.text)
+    data = await state.get_data()
+    service = await get_service(session, data["service_id"])
+    if service and _form_needs(service)[1]:
+        await state.set_state(OrderForm.mentions)
+        await message.answer("Send usernames to mention, separated by spaces or commas.")
+        return
+    await state.set_state(OrderForm.coupon)
+    await message.answer("Coupon code? Send the code, or type <b>skip</b>.", parse_mode="HTML")
+
+
+@router.message(OrderForm.mentions)
+async def form_mentions(message: Message, state: FSMContext) -> None:
+    if not message.text or message.text.startswith("/cancel"):
+        await state.clear()
+        await message.answer("Order cancelled.")
+        return
+    await state.update_data(mentions=message.text)
+    await state.set_state(OrderForm.coupon)
+    await message.answer("Coupon code? Send the code, or type <b>skip</b>.", parse_mode="HTML")
+
+
+@router.message(OrderForm.coupon)
+async def form_coupon(
+    message: Message, state: FSMContext, session: AsyncSession, settings: Settings
+) -> None:
+    if message.from_user is None:
+        return
+    if message.text and message.text.startswith("/cancel"):
+        await state.clear()
+        await message.answer("Order cancelled.")
+        return
+    raw = (message.text or "").strip()
+    coupon = None if raw.lower() in {"skip", "-", "none", "no"} else raw
+    data = await state.get_data()
+    extra = {}
+    if data.get("comments"):
+        extra["comments"] = data["comments"]
+    if data.get("mentions"):
+        extra["mentions"] = data["mentions"]
+    try:
+        quote = await quote_order(
+            session,
+            service_id=data["service_id"],
+            quantity=int(data["quantity"]),
+            user_id=message.from_user.id,
+            coupon_code=coupon,
+        )
+    except ValueError as exc:
+        await message.answer(str(exc) + "\nSend another code, or type skip.")
+        return
+    user = await ensure_user(session, message.from_user, settings)
+    snap = snapshot_of(user)
+    service = await get_service(session, data["service_id"])
+    name = html_escape(service.name if service else data["service_id"])
+    discount_line = (
+        f"Discount ({html_escape(quote.coupon_code or '')}): -{paise_to_rupees_str(quote.discount_paise)}\n"
+        if quote.discount_paise
+        else ""
     )
+    reseller_line = (
+        f"Reseller saving: -{paise_to_rupees_str(quote.reseller_discount_paise)}\n"
+        if quote.reseller_discount_paise
+        else ""
+    )
+    await state.update_data(
+        coupon=quote.coupon_code,
+        extra=extra,
+        quoted_charge=quote.charge_paise,
+        confirm_token=data["service_id"][:20],
+    )
+    await state.set_state(OrderForm.confirm)
+    text = (
+        f"<b>Confirm order</b>\n\n"
+        f"Service: {name}\n"
+        f"Target: {html_escape(str(data.get('link')))}\n"
+        f"Quantity: {int(data['quantity']):,}\n"
+        f"Rate: {paise_to_rupees_str(quote.sell_per_1000_paise)} / 1,000\n"
+        f"Subtotal: {paise_to_rupees_str(quote.subtotal_paise)}\n"
+        f"{reseller_line}"
+        f"{discount_line}"
+        f"<b>Charge: {paise_to_rupees_str(quote.charge_paise)}</b>\n"
+        f"Wallet available: {paise_to_rupees_str(snap.available_paise)}\n\n"
+        "Prices are calculated on the server. Confirm to debit your wallet."
+    )
+    token = data["service_id"]
+    await message.answer(text, reply_markup=order_confirm_kb(token), parse_mode="HTML")
 
 
-@router.callback_query(F.data.startswith("ord:confirm:"))
-async def confirm_order(call: CallbackQuery, state: FSMContext) -> None:
-    await call.answer("⏳ Placing order...")
-    data     = await state.get_data()
-    tg_user  = call.from_user
-    quantity = data.get("quantity", 0)
-    link     = data.get("link", "")
-    idem_key = data.get("idem_key", "")
-    public_id= data.get("public_id", "")
-
-    from app.core.database import AsyncSessionLocal
-    from sqlalchemy import select
-    from app.core.models import Service, User
-
-    async with AsyncSessionLocal() as db:
-        user = (await db.execute(select(User).where(User.telegram_id == tg_user.id))).scalar_one_or_none()
-        if not user:
-            await safe_edit(call.message, error_card("Session expired. Send /start to continue."), reply_markup=back_home_keyboard()); return
-
-        svc = (await db.execute(select(Service).where(Service.public_id == public_id.upper()))).scalar_one_or_none()
-        if not svc:
-            await safe_edit(call.message, error_card("Service not found."), reply_markup=back_home_keyboard()); return
-
-        try:
-            from app.orders.engine import create_order
-            order = await create_order(
-                db=db, user_id=user.id, service_id=svc.id,
-                quantity=quantity, link=link,
-                idempotency_key=idem_key, source="bot",
-            )
-            await db.commit()
-        except Exception as exc:
-            logger.warning("order_create_failed", user_id=user.id, error=str(exc))
-            await safe_edit(call.message, error_card(str(exc)[:200]), reply_markup=back_home_keyboard())
-            return
-
+@router.callback_query(SvcCB.filter(F.a == "ok"))
+async def cb_confirm_order(
+    query: CallbackQuery,
+    callback_data: SvcCB,
+    session: AsyncSession,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if query.from_user is None:
+        return
+    current = await state.get_state()
+    if current != OrderForm.confirm.state:
+        await query.answer("This confirmation expired. Start again.", show_alert=True)
+        return
+    data = await state.get_data()
+    if data.get("service_id") != callback_data.i:
+        await query.answer("Mismatched confirmation.", show_alert=True)
+        return
+    user = await ensure_user(session, query.from_user, settings)
+    try:
+        order = await place_order(
+            session,
+            user,
+            service_id=data["service_id"],
+            link=str(data["link"]),
+            quantity=int(data["quantity"]),
+            extra=data.get("extra") or {},
+            coupon_code=data.get("coupon"),
+        )
+    except InsufficientFunds:
+        await state.clear()
+        await safe_edit(
+            query,
+            "Insufficient balance. Deposit funds and try again.",
+            await menu_kb_for(session, user, settings),
+        )
+        return
+    except (OrderError, PermissionError, ValueError) as exc:
+        await state.clear()
+        await safe_edit(query, f"Could not place order: {html_escape(str(exc))}", None)
+        return
     await state.clear()
     await safe_edit(
-        call.message,
-        order_submitted(order.public_ref, svc.display_name, quantity),
-        reply_markup=back_home_keyboard(),
+        query,
+        f"<b>Order {html_escape(order.public_id)}</b>\n"
+        f"Status: {status_label(order.status)}\n"
+        f"Charged: {paise_to_rupees_str(order.charge_paise)}\n"
+        f"Provider ref: {html_escape(order.provider_order_id or '—')}\n"
+        + (f"\n{html_escape(order.fail_reason)}" if order.fail_reason else ""),
+        await menu_kb_for(session, user, settings),
+    )
+
+
+@router.message(F.text.regexp(r"^/cancel$"))
+async def cmd_cancel_form(
+    message: Message, state: FSMContext, session: AsyncSession, settings: Settings
+) -> None:
+    current = await state.get_state()
+    if current is None:
+        return
+    await state.clear()
+    if message.from_user is None:
+        return
+    user = await ensure_user(session, message.from_user, settings)
+    await message.answer(
+        "Cancelled.\n\n" + await main_menu_text(session, user, settings),
+        reply_markup=await menu_kb_for(session, user, settings),
+        parse_mode="HTML",
     )

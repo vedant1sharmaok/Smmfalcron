@@ -1,526 +1,400 @@
-"""
-Own SMM API — API-as-a-service product.
-
-Exposes a standard SMM panel API interface backed by the platform's
-canonical service catalog. Provider routing is invisible to API customers.
-
-Endpoint: POST /api/v1
-Parameters: key={api_key}&action={action}&[action-specific params]
-
-Supported actions:
-  services      — full service list (canonical IDs only)
-  add           — create order
-  status        — single order status
-  multi_status  — batch order status (comma-separated IDs, max 100)
-  refill        — request refill
-  refill_status — single refill status
-  multi_refill  — batch refill status
-  cancel        — cancel order
-  balance       — API wallet balance
-
-Authentication:
-  SHA-256 hash of raw API key compared against api_customers.api_key_hash.
-  Never bcrypt (too slow for high-frequency API callers).
-  Raw key is shown exactly once at creation; only hash stored.
-
-Rate limiting:
-  Per api_key_hash, per-minute sliding window from api_customer.rate_limit_rpm.
-  Exceeding the limit returns {"error": "Rate limit exceeded"}.
-
-Financial:
-  Every successful order debits the API wallet (not the user wallet).
-  Insufficient API balance returns {"error": "Insufficient balance"}.
-
-Security:
-  Provider IDs, provider names, provider service IDs NEVER in responses.
-  API key never logged, never returned after creation.
-"""
+"""Mini App JSON API. Client-supplied prices are ignored; quotes are always server-side."""
 
 from __future__ import annotations
 
-import uuid
-from decimal import Decimal
 from typing import Any
 
-from fastapi import APIRouter, Depends, Form, Request
-from fastapi.responses import JSONResponse
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy import func, select
 
-from app.core.crypto import hash_api_key
-from app.core.database import get_db
-from app.core.exceptions import (
-    ApiBalanceError,
-    ApiKeyError,
-    DuplicateOrderError,
-    InsufficientBalanceError,
-    ProviderError,
-    ServiceNotFoundError,
+from app.api.limits import check_order
+from app.api.telegram_auth import DbDep, UserDep
+from app.catalog import (
+    featured_stars,
+    get_setting,
+    get_service,
+    kill_switches,
+    list_categories,
 )
-from app.core.logging import get_logger
-from app.core.models import ApiCustomer, ApiWallet, ApiWalletTransaction, Order, Service
-from app.orders.engine import create_order
-from app.providers.registry import registry
-from app.security.kill_switches import assert_api_allowed, assert_orders_allowed
-from app.security.rate_limiter import check_api_key_rate_limit
-from app.services.catalog import get_service_by_public_id, list_active_services
+from app.config import get_settings
+from app.models import Payment, Service
+from app.payments.service import DepositError, check_payment, create_deposit, settle_payment
+from app.orders import (
+    OrderError,
+    get_order_for_user,
+    list_orders,
+    place_order,
+    request_cancel,
+    request_refill,
+    status_label,
+    sync_order_status,
+)
+from app.pricing import paise_to_rupees_str, quote_order
+from app.wallet import InsufficientFunds, list_entries, snapshot_of
 
-logger = get_logger(__name__)
-router = APIRouter(prefix="/api/v1", tags=["own_api"])
-
-_USD_TO_INR = Decimal("83")
-
-
-# ── Auth helper ────────────────────────────────────────────────────────────────
-
-async def _authenticate_api_key(
-    db: AsyncSession, raw_key: str
-) -> ApiCustomer:
-    """
-    Authenticate an API key.
-    SHA-256 hash of the raw key is compared against the stored hash.
-    Returns the ApiCustomer on success; raises ApiKeyError on failure.
-    """
-    if not raw_key or not raw_key.startswith("smm_"):
-        raise ApiKeyError(detail="Invalid API key format")
-
-    key_hash = hash_api_key(raw_key)
-    stmt = select(ApiCustomer).where(
-        ApiCustomer.api_key_hash == key_hash,
-        ApiCustomer.is_active == True,
-    )
-    customer = (await db.execute(stmt)).scalar_one_or_none()
-    if customer is None:
-        raise ApiKeyError(detail="API key not found or inactive")
-    return customer
+router = APIRouter(prefix="/api", tags=["miniapp"])
 
 
-async def _check_api_rate_limit(customer: ApiCustomer, key_hash: str) -> None:
-    """Check per-key rate limit. Raises if exceeded."""
-    result = await check_api_key_rate_limit(
-        key_hash=key_hash,
-        limit_rpm=customer.rate_limit_rpm,
-    )
-    if not result.allowed:
-        raise Exception("rate_limit_exceeded")
+class QuoteIn(BaseModel):
+    service_id: str = Field(min_length=1, max_length=64)
+    quantity: int = Field(gt=0, le=1_000_000_000)
+    coupon_code: str | None = Field(default=None, max_length=32)
+    # Intentionally ignored if a client sends a price:
+    client_price_paise: int | None = None
 
 
-async def _get_api_wallet(db: AsyncSession, customer: ApiCustomer) -> ApiWallet:
-    stmt = select(ApiWallet).where(ApiWallet.api_customer_id == customer.id)
-    wallet = (await db.execute(stmt)).scalar_one_or_none()
-    if wallet is None:
-        # Create wallet on first use.
-        wallet = ApiWallet(
-            api_customer_id=customer.id,
-            balance=Decimal("0"),
-            currency="INR",
-        )
-        db.add(wallet)
-        await db.flush()
-    return wallet
+class OrderIn(BaseModel):
+    service_id: str = Field(min_length=1, max_length=64)
+    link: str = Field(min_length=1, max_length=512)
+    quantity: int = Field(gt=0, le=1_000_000_000)
+    comments: str | None = Field(default=None, max_length=20_000)
+    mentions: str | None = Field(default=None, max_length=20_000)
+    coupon_code: str | None = Field(default=None, max_length=32)
+    idempotency_key: str | None = Field(default=None, max_length=128)
+    client_price_paise: int | None = None
 
 
-async def _debit_api_wallet(
-    db: AsyncSession,
-    wallet: ApiWallet,
-    amount: Decimal,
-    reference_id: str,
-    idempotency_key: str,
-) -> ApiWalletTransaction:
-    """
-    Atomic debit from API wallet.
-    Enforces non-negative balance; raises ApiBalanceError if insufficient.
-    """
-    if wallet.balance < amount:
-        raise ApiBalanceError(
-            detail=f"API wallet balance {wallet.balance} < required {amount}",
-        )
-    balance_before = wallet.balance
-    wallet.balance = wallet.balance - amount
-
-    tx = ApiWalletTransaction(
-        id=str(uuid.uuid4()),
-        api_wallet_id=wallet.id,
-        tx_type="API_ORDER_DEBIT",
-        amount=-amount,
-        balance_before=balance_before,
-        balance_after=wallet.balance,
-        reference_id=reference_id,
-        idempotency_key=idempotency_key,
-    )
-    db.add(tx)
-    await db.flush()
-    return tx
+class DepositIn(BaseModel):
+    amount_paise: int = Field(gt=99, le=100_000_000)
+    idempotency_key: str | None = Field(default=None, max_length=128)
 
 
-def _error(message: str) -> JSONResponse:
-    return JSONResponse({"error": message})
-
-
-def _ok(**kwargs) -> JSONResponse:
-    return JSONResponse(kwargs)
-
-
-# ── Main dispatcher ────────────────────────────────────────────────────────────
-
-@router.post("")
-@router.post("/")
-async def api_dispatch(
-    request: Request,
-    db: AsyncSession = Depends(get_db),
-) -> JSONResponse:
-    """
-    Single-endpoint dispatcher for the own SMM API.
-    Reads `key` and `action` from form data (POST body).
-    Routes to the appropriate handler based on `action`.
-    """
-    await assert_api_allowed()
-
-    try:
-        form = await request.form()
-    except Exception:
-        return _error("Invalid request body")
-
-    raw_key: str = str(form.get("key", ""))
-    action:  str = str(form.get("action", "")).lower().strip()
-
-    if not raw_key:
-        return _error("API key is required")
-    if not action:
-        return _error("Action is required")
-
-    # Authenticate.
-    try:
-        customer = await _authenticate_api_key(db, raw_key)
-    except ApiKeyError:
-        return _error("Invalid API key")
-
-    # Rate limit.
-    key_hash = hash_api_key(raw_key)
-    try:
-        await _check_api_rate_limit(customer, key_hash)
-    except Exception:
-        return _error("Rate limit exceeded")
-
-    # Dispatch.
-    handlers = {
-        "services":      _action_services,
-        "add":           _action_add,
-        "status":        _action_status,
-        "multi_status":  _action_multi_status,
-        "refill":        _action_refill,
-        "refill_status": _action_refill_status,
-        "multi_refill":  _action_multi_refill,
-        "cancel":        _action_cancel,
-        "balance":       _action_balance,
+def _order_out(order) -> dict[str, Any]:
+    return {
+        "public_id": order.public_id,
+        "status": order.status,
+        "status_label": status_label(order.status),
+        "service_id": order.service_id,
+        "link": order.link,
+        "quantity": order.quantity,
+        "charge_paise": order.charge_paise,
+        "charge_display": paise_to_rupees_str(order.charge_paise),
+        "start_count": order.start_count,
+        "remains": order.remains,
+        "coupon_code": order.coupon_code,
+        "fail_reason": order.fail_reason,
+        "created_at": order.created_at.isoformat() if order.created_at else None,
     }
 
-    handler = handlers.get(action)
-    if handler is None:
-        return _error(f"Unknown action: {action!r}")
 
-    try:
-        return await handler(db=db, customer=customer, form=form)
-    except ApiBalanceError:
-        return _error("Insufficient balance")
-    except ApiKeyError:
-        return _error("Invalid API key")
-    except Exception as exc:
-        logger.error("api_action_error", action=action, error=str(exc))
-        return _error("An error occurred. Please try again.")
+@router.get("/me")
+async def me(user: UserDep) -> dict[str, Any]:
+    snap = snapshot_of(user)
+    return {
+        "telegram_id": user.telegram_id,
+        "username": user.username,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "language_code": user.language_code,
+        "name": user.display_name,
+        "role": user.role,
+        "terms_accepted": user.terms_accepted_at is not None,
+        "referral_code": user.referral_code,
+        "wallet": snap.as_dict(),
+        "wallet_display": {
+            "available": paise_to_rupees_str(snap.available_paise),
+            "reserved": paise_to_rupees_str(snap.reserved_paise),
+            "balance": paise_to_rupees_str(snap.balance_paise),
+        },
+    }
 
 
-# ── Action handlers ────────────────────────────────────────────────────────────
+def _service_out(svc: Service, sell: int) -> dict[str, Any]:
+    return {
+        "id": svc.id,
+        "name": svc.name,
+        "description": svc.description,
+        "type": svc.service_type,
+        "min_qty": svc.min_qty,
+        "max_qty": svc.max_qty,
+        "sell_per_1000_paise": sell,
+        "sell_per_1000_display": paise_to_rupees_str(sell),
+        "refillable": svc.is_refillable,
+        "cancelable": svc.is_cancelable,
+        "average_time": svc.average_time,
+        "category_id": svc.category_id,
+    }
 
-async def _action_services(db, customer, form) -> JSONResponse:
-    """
-    Return the platform's canonical service catalog.
-    Provider IDs and provider service IDs are NEVER included.
-    """
-    services, total = await list_active_services(db, page=1, page_size=10000)
 
-    result = []
-    for svc in services:
-        from app.services.catalog import resolve_provider_mapping
-        from app.core.models import ProviderService as PSRow
-        from app.pricing.engine import calculate_price
+@router.get("/config")
+async def app_config(session: DbDep, user: UserDep) -> dict[str, Any]:
+    settings = get_settings()
+    flags = await kill_switches(session)
+    return {
+        "brand": await get_setting(session, "brand_name", "FALARON"),
+        "currency": settings.currency_code,
+        "symbol": settings.currency_symbol,
+        "min_deposit_paise": settings.min_deposit_paise,
+        "max_deposit_paise": settings.max_deposit_paise,
+        "payment_method": settings.payment_gateway,
+        "demo_payments": settings.mock_payments_allowed,
+        "terms_url": await get_setting(session, "terms_url", ""),
+        "privacy_url": await get_setting(session, "privacy_url", ""),
+        "flags": flags,
+    }
 
-        try:
-            mapping = await resolve_provider_mapping(db, svc.id)
-            stmt = select(PSRow).where(
-                PSRow.provider_id == mapping.provider_id,
-                PSRow.provider_svc_id == mapping.provider_svc_id,
-                PSRow.is_active == True,
+
+@router.get("/catalog")
+async def catalog(session: DbDep, user: UserDep) -> dict[str, Any]:
+    """Categories with live service counts. Services load per category (paged) so a
+    synced catalog of thousands of services never turns into thousands of queries."""
+    cats = await list_categories(session)
+    counts = dict(
+        (
+            await session.execute(
+                select(Service.category_id, func.count())
+                .where(Service.is_active.is_(True))
+                .group_by(Service.category_id)
             )
-            ps = (await db.execute(stmt)).scalar_one_or_none()
-            rate    = ps.rate    if ps and ps.rate    else Decimal("0")
-            min_qty = ps.min_qty if ps and ps.min_qty else 1
-            max_qty = ps.max_qty if ps and ps.max_qty else 1_000_000
-            refill  = ps.refill  if ps else False
-            cancel  = ps.cancel  if ps else False
-
-            price_result = await calculate_price(
-                db=db, service=svc, quantity=1000,
-                provider_rate=rate,
-                provider_currency="USD", target_currency="INR",
-                usd_to_inr_rate=_USD_TO_INR,
-            )
-            rate_display = str(price_result.customer_price)
-        except Exception:
-            rate_display = "0"
-            min_qty = 1; max_qty = 1_000_000
-            refill  = False; cancel = False
-
-        result.append({
-            "service":     svc.public_id,   # canonical ID — no provider ID
-            "name":        svc.display_name,
-            "category":    svc.category.name if svc.category else "",
-            "type":        "Default",
-            "rate":        rate_display,
-            "min":         str(min_qty),
-            "max":         str(max_qty),
-            "refill":      refill,
-            "cancel":      cancel,
-            "description": svc.description or "",
-        })
-
-    return JSONResponse(result)
-
-
-async def _action_add(db, customer, form) -> JSONResponse:
-    """
-    Create a new order. Debits the API wallet.
-    Accepts the platform's canonical service public_id as `service`.
-    """
-    service_id_raw = str(form.get("service", "")).strip()
-    quantity_raw   = str(form.get("quantity", "")).strip()
-    link           = str(form.get("link", "")).strip() or None
-    idem_key       = str(form.get("idempotency_key", "")) or str(uuid.uuid4())
-
-    if not service_id_raw:
-        return _error("service is required")
-    if not quantity_raw.isdigit():
-        return _error("quantity must be a positive integer")
-
-    quantity = int(quantity_raw)
-    public_id = service_id_raw.upper()
-    if not public_id.startswith("SVC-"):
-        return _error("Invalid service ID format. Use platform service IDs (e.g. SVC-0001).")
-
-    try:
-        svc = await get_service_by_public_id(db, public_id)
-    except ServiceNotFoundError:
-        return _error("Service not found")
-
-    await assert_orders_allowed(service_id=svc.id, category_id=svc.category_id)
-
-    # Calculate price.
-    from app.services.catalog import resolve_provider_mapping
-    from app.core.models import ProviderService as PSRow
-    from app.pricing.engine import calculate_price
-
-    try:
-        mapping = await resolve_provider_mapping(db, svc.id)
-        stmt = select(PSRow).where(
-            PSRow.provider_id == mapping.provider_id,
-            PSRow.provider_svc_id == mapping.provider_svc_id,
-        )
-        ps      = (await db.execute(stmt)).scalar_one_or_none()
-        rate    = ps.rate if ps and ps.rate else Decimal("0")
-
-        price_result = await calculate_price(
-            db=db, service=svc, quantity=quantity,
-            provider_rate=rate,
-            provider_currency="USD", target_currency="INR",
-            usd_to_inr_rate=_USD_TO_INR,
-        )
-        price = price_result.customer_price
-    except Exception as exc:
-        return _error(f"Pricing error: {exc}")
-
-    # Check and debit API wallet.
-    api_wallet = await _get_api_wallet(db, customer)
-    order_id   = str(uuid.uuid4())
-
-    try:
-        await _debit_api_wallet(
-            db=db, wallet=api_wallet, amount=price,
-            reference_id=order_id,
-            idempotency_key=f"api_order:{idem_key}",
-        )
-    except ApiBalanceError:
-        return _error("Insufficient balance")
-
-    # Submit via order engine.
-    try:
-        order = await create_order(
-            db=db, registry=registry,
-            user_id=customer.tenant_id or 0,   # API customer identified by tenant
-            service_id=svc.id,
-            quantity=quantity,
-            link=link,
-            source="api",
-            api_customer_id=customer.id,
-            idempotency_key=idem_key,
-            usd_to_inr_rate=_USD_TO_INR,
-        )
-    except DuplicateOrderError:
-        # Refund the debit since we're not creating a new order.
-        await _refund_api_wallet(db, api_wallet, price, order_id)
-        # Find existing order and return it.
-        stmt = select(Order).where(Order.idempotency_key == idem_key)
-        existing = (await db.execute(stmt)).scalar_one_or_none()
-        if existing:
-            return _ok(order=existing.public_ref)
-        return _error("Duplicate order")
-    except Exception as exc:
-        # Refund on any failure.
-        await _refund_api_wallet(db, api_wallet, price, order_id)
-        return _error(f"Order failed: {exc}")
-
-    return _ok(order=order.public_ref)
-
-
-async def _refund_api_wallet(
-    db, wallet: ApiWallet, amount: Decimal, reference_id: str
-) -> None:
-    """Compensating credit to API wallet on order failure."""
-    try:
-        balance_before   = wallet.balance
-        wallet.balance   = wallet.balance + amount
-        refund_tx = ApiWalletTransaction(
-            id=str(uuid.uuid4()),
-            api_wallet_id=wallet.id,
-            tx_type="API_REFUND",
-            amount=amount,
-            balance_before=balance_before,
-            balance_after=wallet.balance,
-            reference_id=reference_id,
-            idempotency_key=f"api_refund:{reference_id}",
-        )
-        db.add(refund_tx)
-        await db.flush()
-    except Exception as exc:
-        logger.error("api_wallet_refund_failed", error=str(exc))
-
-
-async def _action_status(db, customer, form) -> JSONResponse:
-    """Single order status by public_ref."""
-    order_ref = str(form.get("order", "")).strip()
-    if not order_ref:
-        return _error("order is required")
-
-    stmt = select(Order).where(
-        Order.public_ref == order_ref,
-        Order.api_customer_id == customer.id,
+        ).all()
     )
-    order = (await db.execute(stmt)).scalar_one_or_none()
-    if order is None:
-        return _error("Order not found")
-
-    return _ok(
-        charge=str(order.price_charged),
-        start_count=order.start_count or 0,
-        status=order.status.title(),
-        remains=order.remains or 0,
-        currency="INR",
-    )
-
-
-async def _action_multi_status(db, customer, form) -> JSONResponse:
-    """Batch order status — comma-separated public_refs, max 100."""
-    orders_raw = str(form.get("orders", "")).strip()
-    if not orders_raw:
-        return _error("orders is required")
-
-    refs = [r.strip() for r in orders_raw.split(",") if r.strip()][:100]
-    stmt = select(Order).where(
-        Order.public_ref.in_(refs),
-        Order.api_customer_id == customer.id,
-    )
-    orders = list((await db.execute(stmt)).scalars().all())
-    order_map = {o.public_ref: o for o in orders}
-
-    result = {}
-    for ref in refs:
-        o = order_map.get(ref)
-        if o:
-            result[ref] = {
-                "charge":      str(o.price_charged),
-                "start_count": o.start_count or 0,
-                "status":      o.status.title(),
-                "remains":     o.remains or 0,
-                "currency":    "INR",
+    payload = [
+        {
+            "id": cat.id,
+            "name": cat.name,
+            "emoji": cat.emoji,
+            "description": cat.description,
+            "service_count": int(counts.get(cat.id, 0)),
+        }
+        for cat in cats
+        if counts.get(cat.id, 0)
+    ]
+    stars = []
+    for star, svc in await featured_stars(session):
+        stars.append(
+            {
+                "id": star.id,
+                "label": star.label,
+                "service_id": svc.id,
+                "name": svc.name,
+                "rate_per_1000_paise": star.custom_rate_per_1000_paise,
+                "rate_display": paise_to_rupees_str(star.custom_rate_per_1000_paise),
             }
-        else:
-            result[ref] = {"error": "Not found"}
-    return JSONResponse(result)
+        )
+    return {"categories": payload, "stars": stars}
 
 
-async def _action_refill(db, customer, form) -> JSONResponse:
-    """Request a refill for an order."""
-    order_ref = str(form.get("order", "")).strip()
-    stmt = select(Order).where(
-        Order.public_ref == order_ref,
-        Order.api_customer_id == customer.id,
-        Order.refill_eligible == True,
+@router.get("/categories/{category_id}/services")
+async def category_services(
+    category_id: str, session: DbDep, user: UserDep, limit: int = 40, offset: int = 0
+) -> dict[str, Any]:
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+    rows = (
+        (
+            await session.execute(
+                select(Service)
+                .where(Service.category_id == category_id, Service.is_active.is_(True))
+                .order_by(Service.name)
+                .offset(offset)
+                .limit(limit + 1)
+            )
+        )
+        .scalars()
+        .all()
     )
-    order = (await db.execute(stmt)).scalar_one_or_none()
-    if order is None:
-        return _error("Order not found or not eligible for refill")
+    has_more = len(rows) > limit
+    items = []
+    for svc in rows[:limit]:
+        try:
+            q = await quote_order(session, service_id=svc.id, quantity=svc.min_qty, user_id=user.telegram_id)
+        except ValueError:
+            continue  # never fall back to the provider cost: that would leak our margin
+        items.append(_service_out(svc, q.sell_per_1000_paise))
+    return {"services": items, "has_more": has_more}
 
+
+@router.post("/quote")
+async def quote(body: QuoteIn, session: DbDep, user: UserDep) -> dict[str, Any]:
+    # client_price_paise is discarded on purpose
     try:
-        result = await registry.refill(order.provider_id, order.provider_order_id)
-        return _ok(refill=result.refill_id)
-    except Exception as exc:
-        return _error(f"Refill failed: {exc}")
+        q = await quote_order(
+            session,
+            service_id=body.service_id,
+            quantity=body.quantity,
+            user_id=user.telegram_id,
+            coupon_code=body.coupon_code,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    out = q.as_dict()
+    # Provider cost and reseller internals are business data: never sent to customers.
+    for hidden in ("cost_per_1000_paise", "cost_paise", "layer", "reseller_discount_paise"):
+        out.pop(hidden, None)
+    return out
 
 
-async def _action_refill_status(db, customer, form) -> JSONResponse:
-    """Single refill status."""
-    refill_id = str(form.get("refill", "")).strip()
-    if not refill_id:
-        return _error("refill is required")
+@router.post("/orders")
+async def create_order(body: OrderIn, session: DbDep, user: UserDep) -> dict[str, Any]:
+    check_order(user.telegram_id)
+    extra: dict[str, Any] = {}
+    if body.comments:
+        extra["comments"] = body.comments
+    if body.mentions:
+        extra["mentions"] = body.mentions
+    try:
+        order = await place_order(
+            session,
+            user,
+            service_id=body.service_id,
+            link=body.link,
+            quantity=body.quantity,
+            extra=extra,
+            coupon_code=body.coupon_code,
+            idempotency_key=body.idempotency_key,
+        )
+    except InsufficientFunds as exc:
+        raise HTTPException(status_code=402, detail=str(exc)) from exc
+    except (OrderError, PermissionError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _order_out(order)
 
-    # Find the order's provider_id to route the refill status check.
-    # For now return a generic pending status — full wiring in Phase 17.
-    return _ok(status="Pending")
+
+@router.get("/orders")
+async def orders(session: DbDep, user: UserDep, limit: int = 20, offset: int = 0) -> dict[str, Any]:
+    rows = await list_orders(session, user.telegram_id, limit=min(limit, 50), offset=offset)
+    return {"orders": [_order_out(o) for o in rows]}
 
 
-async def _action_multi_refill(db, customer, form) -> JSONResponse:
-    """Batch refill status — comma-separated refill IDs, max 100."""
-    refills_raw = str(form.get("refills", "")).strip()
-    if not refills_raw:
-        return _error("refills is required")
-
-    ids = [r.strip() for r in refills_raw.split(",") if r.strip()][:100]
-    return JSONResponse({rid: {"status": "Pending"} for rid in ids})
+@router.get("/orders/{public_id}")
+async def order_detail(public_id: str, session: DbDep, user: UserDep) -> dict[str, Any]:
+    order = await get_order_for_user(session, public_id, user.telegram_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return _order_out(order)
 
 
-async def _action_cancel(db, customer, form) -> JSONResponse:
-    """Cancel an order."""
-    order_ref = str(form.get("order", "")).strip()
-    stmt = select(Order).where(
-        Order.public_ref == order_ref,
-        Order.api_customer_id == customer.id,
-        Order.cancel_eligible == True,
+@router.post("/orders/{public_id}/refresh")
+async def order_refresh(public_id: str, session: DbDep, user: UserDep) -> dict[str, Any]:
+    order = await get_order_for_user(session, public_id, user.telegram_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="Order not found")
+    order = await sync_order_status(session, order)
+    return _order_out(order)
+
+
+@router.post("/orders/{public_id}/refill")
+async def order_refill(public_id: str, session: DbDep, user: UserDep) -> dict[str, Any]:
+    order = await get_order_for_user(session, public_id, user.telegram_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="Order not found")
+    try:
+        order = await request_refill(session, order, user)
+    except (OrderError, PermissionError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _order_out(order)
+
+
+@router.post("/orders/{public_id}/cancel")
+async def order_cancel(public_id: str, session: DbDep, user: UserDep) -> dict[str, Any]:
+    order = await get_order_for_user(session, public_id, user.telegram_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="Order not found")
+    try:
+        order = await request_cancel(session, order, user)
+    except (OrderError, PermissionError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _order_out(order)
+
+
+@router.get("/wallet")
+async def wallet(session: DbDep, user: UserDep) -> dict[str, Any]:
+    snap = snapshot_of(user)
+    entries = await list_entries(session, user.telegram_id, limit=25)
+    return {
+        "wallet": snap.as_dict(),
+        "wallet_display": {
+            "available": paise_to_rupees_str(snap.available_paise),
+            "reserved": paise_to_rupees_str(snap.reserved_paise),
+            "balance": paise_to_rupees_str(snap.balance_paise),
+        },
+        "ledger": [
+            {
+                "id": e.id,
+                "type": e.entry_type,
+                "amount_paise": e.amount_paise,
+                "amount_display": paise_to_rupees_str(e.amount_paise),
+                "reason": e.reason,
+                "balance_after_paise": e.balance_after_paise,
+                "created_at": e.created_at.isoformat() if e.created_at else None,
+            }
+            for e in entries
+        ],
+    }
+
+
+def _payment_out(payment: Payment) -> dict[str, Any]:
+    return {
+        "public_id": payment.public_id,
+        "status": payment.status,
+        "amount_paise": payment.amount_paise,
+        "amount_display": paise_to_rupees_str(payment.amount_paise),
+        "method": payment.method,
+        "checkout_url": payment.checkout_url if payment.status == "pending" else None,
+        "failure_reason": None,  # internal detail; the user only needs the status
+    }
+
+
+@router.post("/deposit")
+async def deposit(body: DepositIn, session: DbDep, user: UserDep) -> dict[str, Any]:
+    settings = get_settings()
+    try:
+        payment = await create_deposit(
+            session, user, body.amount_paise, settings=settings, idempotency_key=body.idempotency_key
+        )
+    except DepositError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    out = _payment_out(payment)
+    if payment.method == "manual":
+        out["instructions"] = await get_setting(session, "payment_instructions", "")
+    return out
+
+
+@router.get("/deposit/{public_id}")
+async def deposit_status(public_id: str, session: DbDep, user: UserDep) -> dict[str, Any]:
+    """Polled by the Mini App after the customer returns from the payment page."""
+    payment = await check_payment(session, public_id, user.telegram_id, settings=get_settings())
+    if payment is None:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    await session.refresh(user)
+    out = _payment_out(payment)
+    out["wallet"] = snapshot_of(user).as_dict()
+    return out
+
+
+@router.post("/deposit/{public_id}/mock-pay")
+async def mock_pay(public_id: str, session: DbDep, user: UserDep) -> dict[str, Any]:
+    """Development only. In production this route does not exist as far as clients can tell."""
+    settings = get_settings()
+    if not settings.mock_payments_allowed:
+        raise HTTPException(status_code=404, detail="Not found")
+    payment = (
+        await session.execute(select(Payment).where(Payment.public_id == public_id))
+    ).scalar_one_or_none()
+    if payment is None or payment.user_id != user.telegram_id or payment.method != "mock":
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    await settle_payment(
+        session,
+        payment_public_id=payment.public_id,
+        gateway="mock",
+        gateway_ref=None,
+        amount_paise=payment.amount_paise,
+        currency=payment.currency,
+        source="mock",
+        actor=str(user.telegram_id),
     )
-    order = (await db.execute(stmt)).scalar_one_or_none()
-    if order is None:
-        return _error("Order not found or cannot be cancelled")
+    await session.refresh(user)
+    return {"public_id": payment.public_id, "status": payment.status, "wallet": snapshot_of(user).as_dict()}
 
+
+@router.get("/services/{service_id}")
+async def service_detail(service_id: str, session: DbDep, user: UserDep) -> dict[str, Any]:
+    svc = await get_service(session, service_id)
+    if svc is None or not svc.is_active:
+        raise HTTPException(status_code=404, detail="Service not found")
     try:
-        result = await registry.cancel(order.provider_id, order.provider_order_id)
-        if result.success:
-            from app.orders.engine import update_order_status
-            await update_order_status(db, order.id, "cancelled")
-            return JSONResponse([{"order": order_ref, "cancel": {"1": "success"}}])
-        return _error("Cancellation rejected by provider")
-    except Exception as exc:
-        return _error(f"Cancel failed: {exc}")
-
-
-async def _action_balance(db, customer, form) -> JSONResponse:
-    """Return the API wallet balance."""
-    api_wallet = await _get_api_wallet(db, customer)
-    return _ok(balance=str(api_wallet.balance), currency="INR")
+        q = await quote_order(session, service_id=svc.id, quantity=svc.min_qty, user_id=user.telegram_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Service not available") from exc
+    return _service_out(svc, q.sell_per_1000_paise)

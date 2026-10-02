@@ -1,0 +1,17 @@
+{$DOMAIN} {
+	encode zstd gzip
+
+	# Only the app is exposed; the database is on a private network with no published port.
+	reverse_proxy app:8080 {
+		header_up X-Forwarded-For {remote_host}
+	}
+
+	header {
+		-Server
+		X-Content-Type-Options nosniff
+	}
+
+	request_body {
+		max_size 1MB
+	}
+}
